@@ -1,4 +1,4 @@
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, g
 from flask_cors import CORS
 import os
 import psycopg2
@@ -7,71 +7,93 @@ import google.generativeai as genai
 import sys
 import tempfile
 from dotenv import load_dotenv
+from flask_bcrypt import Bcrypt
+from flask_jwt_extended import create_access_token, get_jwt_identity, jwt_required, JWTManager
+
 load_dotenv()
 
 # ----------------------------
-# Config (SECURE VERSION)
+# Config
 # ----------------------------
 DB_URI = os.getenv("DB_URI")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+JWT_SECRET_KEY = os.getenv("JWT_SECRET_KEY", "your-super-secret-key-fallback")
 
-if not GEMINI_API_KEY:
-    print("ERROR: GEMINI_API_KEY environment variable not set.")
-    sys.exit(1)
-if not DB_URI:
-    print("ERROR: DB_URI environment variable not set.")
+if not GEMINI_API_KEY or not DB_URI:
+    print("ERROR: Environment variables not set.")
     sys.exit(1)
 
 genai.configure(api_key=GEMINI_API_KEY)
 
-# ----------------------------
-# Database connection
-# ----------------------------
-conn = None
-try:
-    print("Connecting to the database...")
-    conn = psycopg2.connect(DB_URI)
-    cur = conn.cursor()
-    print("Database connection successful.")
+# -----------------------------------------------
+# --- NEW: Professional Database Connection Management ---
+# -----------------------------------------------
+def get_db():
+    """Opens a new database connection for each request."""
+    if 'db' not in g:
+        g.db = psycopg2.connect(DB_URI)
+    return g.db
 
-    # --- AUTOMATIC DATABASE SETUP ---
-    print("Ensuring 'documents' table exists...")
-    setup_query = """
-    CREATE EXTENSION IF NOT EXISTS vector;
-    CREATE TABLE IF NOT EXISTS documents (
-        id SERIAL PRIMARY KEY,
-        file_name VARCHAR(255),
-        chunk_text TEXT,
-        embedding VECTOR(768)
-    );
-    """
-    cur.execute(setup_query)
-    conn.commit()
-    print("Database is ready.")
-    # --- END OF AUTOMATIC SETUP ---
-
-except psycopg2.OperationalError as e:
-    print(f"FATAL: Could not connect to the database: {e}")
-    print("Please check your DB_URI environment variable and database status.")
-    sys.exit(1)
+def init_db(app_context):
+    """Initializes the database schema if tables don't exist."""
+    with app_context.app_context():
+        db = get_db()
+        cur = db.cursor()
+        print("Ensuring database schema is up to date...")
+        cur.execute("CREATE EXTENSION IF NOT EXISTS vector;")
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                id SERIAL PRIMARY KEY,
+                email VARCHAR(255) UNIQUE NOT NULL,
+                password_hash VARCHAR(255) NOT NULL,
+                created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+            );
+        """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS documents (
+                id SERIAL PRIMARY KEY,
+                file_name VARCHAR(255),
+                chunk_text TEXT,
+                embedding VECTOR(768),
+                user_id INTEGER REFERENCES users(id) ON DELETE CASCADE
+            );
+        """)
+        db.commit()
+        cur.close()
+        print("Database is ready.")
 
 # ----------------------------
 # Flask setup
 # ----------------------------
 app = Flask(__name__)
-# CORS FIX HERE: More specific CORS configuration
+app.config["JWT_SECRET_KEY"] = JWT_SECRET_KEY
 CORS(app, resources={r"/*": {"origins": "*"}})
 
+bcrypt = Bcrypt(app)
+jwt = JWTManager(app)
+
+# Initialize DB schema when app starts
+try:
+    init_db(app)
+except Exception as e:
+    print(f"FATAL: Database initialization failed: {e}")
+    sys.exit(1)
+
+@app.teardown_appcontext
+def close_db(e=None):
+    """Closes the database connection at the end of the request."""
+    db = g.pop('db', None)
+    if db is not None:
+        db.close()
 
 # ----------------------------
-# Helpers (UPDATED CHUNKING LOGIC)
+# Helper Functions (Your Original Code)
 # ----------------------------
 def text_from_pdf(file_path: str) -> str:
     reader = PdfReader(file_path)
     return "\n".join([p.extract_text() or "" for p in reader.pages])
 
 def sliding_window_chunker(text, chunk_size=800, overlap=200):
-    """The original chunking function, now renamed."""
     tokens = text.split()
     chunks = []
     i = 0
@@ -82,29 +104,20 @@ def sliding_window_chunker(text, chunk_size=800, overlap=200):
     return chunks
 
 def smart_chunker(text, chunk_size=800, overlap=200):
-    """
-    A new, content-aware chunker that respects paragraph boundaries.
-    """
     final_chunks = []
     paragraphs = text.split('\n\n')
-    
     for para in paragraphs:
         para_stripped = para.strip()
         if not para_stripped:
-            continue # Ignore empty paragraphs
-
-        # If the paragraph is smaller than the chunk size, treat it as a whole chunk
+            continue
         if len(para_stripped.split()) <= chunk_size:
             final_chunks.append(para_stripped)
-        # If the paragraph is too long, use the sliding window chunker on it
         else:
             sub_chunks = sliding_window_chunker(para_stripped, chunk_size=chunk_size, overlap=overlap)
             final_chunks.extend(sub_chunks)
-            
     return final_chunks
 
 def embed_texts(texts):
-    """Generate embeddings using Gemini's embedding model."""
     try:
         result = genai.embed_content(model="models/embedding-001", content=texts, task_type="retrieval_document")
         return result['embedding']
@@ -112,12 +125,65 @@ def embed_texts(texts):
         print(f"Error embedding texts: {e}")
         return [[] for _ in texts]
 
+# ---------------------------------
+# Authentication Routes
+# ---------------------------------
+@app.route("/register", methods=["POST"])
+def register():
+    data = request.json
+    email = data.get("email")
+    password = data.get("password")
 
-# ----------------------------
-# Routes
-# ----------------------------
+    if not email or not password:
+        return jsonify({"error": "Email and password are required"}), 400
+
+    hashed_password = bcrypt.generate_password_hash(password).decode('utf-8')
+    
+    conn = get_db()
+    cur = conn.cursor()
+    try:
+        cur.execute("INSERT INTO users (email, password_hash) VALUES (%s, %s)", (email, hashed_password))
+        conn.commit()
+    except psycopg2.IntegrityError:
+        conn.rollback()
+        return jsonify({"error": "Email already exists"}), 409
+    except Exception as e:
+        conn.rollback()
+        return jsonify({"error": str(e)}), 500
+    finally:
+        cur.close()
+
+    return jsonify({"message": "User registered successfully"}), 201
+
+@app.route("/login", methods=["POST"])
+def login():
+    data = request.json
+    email = data.get("email")
+    password = data.get("password")
+
+    if not email or not password:
+        return jsonify({"error": "Email and password are required"}), 400
+
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("SELECT id, password_hash FROM users WHERE email = %s", (email,))
+    user = cur.fetchone()
+    cur.close()
+
+    if user and bcrypt.check_password_hash(user[1], password):
+        user_id = user[0]
+        access_token = create_access_token(identity=str(user_id))
+        return jsonify(access_token=access_token)
+    else:
+        return jsonify({"error": "Invalid email or password"}), 401
+
+# ---------------------------------
+# Protected Routes
+# ---------------------------------
 @app.route("/upload", methods=["POST"])
+@jwt_required()
 def upload():
+    current_user_id = get_jwt_identity()
     file = request.files.get("file")
     if not file:
         return jsonify({"error": "no file"}), 400
@@ -139,25 +205,34 @@ def upload():
         if os.path.exists(tmp_path):
             os.remove(tmp_path)
 
-    # UPDATED to use the new smart_chunker
     chunks = smart_chunker(text)
     embeddings = embed_texts(chunks)
 
     if not all(embeddings):
         return jsonify({"error": "Failed to generate embeddings."}), 500
-
-    for chunk, emb in zip(chunks, embeddings):
-        emb_str = str(list(emb))
-        cur.execute(
-            "INSERT INTO documents (file_name, chunk_text, embedding) VALUES (%s, %s, %s)",
-            (fname, chunk, emb_str)
-        )
-    conn.commit()
+    
+    conn = get_db()
+    cur = conn.cursor()
+    try:
+        for chunk, emb in zip(chunks, embeddings):
+            emb_str = str(list(emb))
+            cur.execute(
+                "INSERT INTO documents (file_name, chunk_text, embedding, user_id) VALUES (%s, %s, %s, %s)",
+                (fname, chunk, emb_str, current_user_id)
+            )
+        conn.commit()
+    except Exception as e:
+        conn.rollback()
+        return jsonify({"error": str(e)}), 500
+    finally:
+        cur.close()
 
     return jsonify({"message": "uploaded", "chunks_added": len(chunks)})
 
 @app.route("/query", methods=["POST"])
+@jwt_required()
 def query():
+    current_user_id = get_jwt_identity()
     data = request.json
     q = data.get("question", "")
     k = int(data.get("k", 4))
@@ -169,11 +244,14 @@ def query():
     )['embedding']
     q_emb_str = str(list(q_emb))
 
+    conn = get_db()
+    cur = conn.cursor()
     cur.execute(
-        "SELECT chunk_text FROM documents ORDER BY embedding <-> %s::vector LIMIT %s",
-        (q_emb_str, k)
+        "SELECT chunk_text FROM documents WHERE user_id = %s ORDER BY embedding <-> %s::vector LIMIT %s",
+        (current_user_id, q_emb_str, k)
     )
     rows = cur.fetchall()
+    cur.close()
     context = "\n".join([r[0] for r in rows])
 
     system_prompt = "You are a humble helpful assistant..."
